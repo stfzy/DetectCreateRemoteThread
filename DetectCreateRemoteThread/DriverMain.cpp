@@ -22,16 +22,7 @@ VOID CreateThreadNotifyRoutine(
 		const CHAR* pTemp = pCurrProcessName;
 		if (pTemp)
 			stPathLen = strlen(pTemp);
-
-		for (size_t i = 0; i < stPathLen; i++)
-		{
-			DbgPrint("%02x ", pTemp[i]);
-		}
-		  
-			
-		DbgPrint("\r\n");
-
-
+		 
 		ANSI_STRING asProcessName = {0};
 		RtlInitAnsiString(&asProcessName, pCurrProcessName == NULL ? "NULL" : (const char *)pCurrProcessName);
 		DbgPrint(

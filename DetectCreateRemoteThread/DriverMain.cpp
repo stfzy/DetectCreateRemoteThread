@@ -14,7 +14,8 @@ nt!NtCreateThread:
 
 */
 extern "C" DRIVER_INITIALIZE DriverEntry;
-ReloadZwQueryVirtualMemory pfn_ZwQueryVirutalMemrory = NULL;
+ReloadZwQueryVirtualMemory g_pfn_ZwQueryVirutalMemrory = NULL;
+/*
 PVOID pre;
 BOOLEAN InitNoExportApi()
 {
@@ -24,7 +25,7 @@ BOOLEAN InitNoExportApi()
 	if (pfn_ZwQueryVirutalMemrory != NULL)
 		return TRUE;
 	return FALSE;
-}
+}*/
 // OB_PREOP_CALLBACK_STATUS
 // preCall(PVOID RegistrationContext, POB_PRE_OPERATION_INFORMATION pOperationInformation)
 // { 
@@ -182,6 +183,7 @@ BOOLEAN InitNoExportApi()
 // 	return OB_PREOP_SUCCESS;
 // }
 
+/*
 void ThreadProcedure(PVOID ParameterData)
 {
 	HANDLE hThreadId = (HANDLE)ParameterData;
@@ -205,11 +207,12 @@ void ThreadProcedure(PVOID ParameterData)
 		KeSleep(10);
 	}
 	PsTerminateSystemThread(STATUS_SUCCESS);
-}
-PVOID GetZwQueryVirtualMemoryAddress()
-{
-	 
-	PUCHAR ulSearchStart;
+}*/
+ 
+ PVOID  GetZwQueryVirtualMemoryAddress() noexcept
+ {
+	   
+	PUCHAR ulSearchStart = NULL;
  
 
 	/*
@@ -225,13 +228,19 @@ PVOID GetZwQueryVirtualMemoryAddress()
 	804ffba4 b8b3000000      mov     eax,0B3h
 	804ffba9 8d542404        lea     edx,[esp+4]
 	*/
-	 
-	 
-		ulSearchStart = (PUCHAR)ZwQueryVolumeInformationFile;
-		 
-	 
-	return ulSearchStart - 0x14;
+	
+	// Only do one test on Windows XP SP3 
+	__try
+	{
+		ulSearchStart = reinterpret_cast<PUCHAR>(ZwQueryVolumeInformationFile);
+		return reinterpret_cast<PVOID>(reinterpret_cast<ULONG_PTR>(ulSearchStart) - 0x14);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return NULL;
+	} 
 }
+/*
 
 VOID CreateThreadNotifyRoutine(
 	IN HANDLE  ProcessId,
@@ -401,7 +410,7 @@ VOID CreateThreadNotifyRoutine(
 		 
 	}
 
-}
+}*/
 typedef
 NTSTATUS
 (NTAPI*
@@ -415,20 +424,137 @@ NTSTATUS
 		IN PVOID UserStack,
 		IN BOOLEAN CreateSuspended
 		);
-pfn_NtCreateThread org = NULL;
+pfn_NtCreateThread g_pfnOrgNtCreateThread = NULL;
 _Function_class_(DRIVER_UNLOAD)
 VOID DriverUnload(
 	_In_ struct _DRIVER_OBJECT *DriverObject
 )
 {
 	UNREFERENCED_PARAMETER(DriverObject);
-	*(PULONG)0x80502c60 = (ULONG)org;
+	*(PULONG)0x80502c60 = reinterpret_cast<ULONG>(g_pfnOrgNtCreateThread);
 	//ObUnRegisterCallbacks(pre);
 	//PsRemoveCreateThreadNotifyRoutine(CreateThreadNotifyRoutine);
 }
 
+int StGetProcessFullPathByObject(PEPROCESS pEprocess,PUNICODE_STRING & pProcessPath)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	HANDLE hProcess = NULL;
+	PVOID  pBaseAddress = NULL;
+	BOOLEAN bAttach = FALSE;
+	KAPC_STATE ApcState = {};
+	int iRet = 0;
+
+	if (NULL == pEprocess )
+		return 1;
+	
+	// First reference the object
+	ObReferenceObject(pEprocess);
+
+	// Get PEB
+	PPEB pPeb = PsGetProcessPeb(pEprocess);
+
+	
+	if (NULL == pPeb )
+	{
+		iRet = 2;
+		goto _OPEN_OBJECT_FAILED;
+	}
+
+	// Get process handle 
+	status = ObOpenObjectByPointer(
+		pEprocess,               
+		OBJ_KERNEL_HANDLE,    
+		NULL,                
+		0x0400,				 
+		*PsProcessType,     
+		KernelMode,         
+		&hProcess
+	);
+
+	if (!NT_SUCCESS(status))
+	{
+		KdPrint(("ObOpenObjectByPointer failed:%u \r\n", RtlNtStatusToDosError(status)));
+		iRet = 3;
+		goto _OPEN_OBJECT_FAILED;
+		 
+	}
+
+	pProcessPath = (PUNICODE_STRING)ExAllocatePoolWithTag(NonPagedPoolNx, 260 * sizeof(WCHAR),'STPH');
+	 
+
+	if (NULL == pProcessPath)
+	{ 
+		KdPrint(("ExAllocatePool failed \r\n"));
+		iRet = 4;
+		goto _ALLOC_MEM_FAILED;
+	}
+
+	memset(pProcessPath, 0, 260 * sizeof(WCHAR));
+	  
+	
+	if (pEprocess != PsGetCurrentProcess()) {
+		bAttach = TRUE;
+		KeStackAttachProcess(pEprocess, &ApcState);
+	}
+
+	__try {
+		pBaseAddress = pPeb->ImageBaseAddress;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		pBaseAddress = NULL;
+	}
+
+	if (bAttach) {
+		KeUnstackDetachProcess(&ApcState);
+		bAttach = FALSE;
+	}
+
+	  
+	if (pBaseAddress == NULL)
+	{ 
+		KdPrint(("KeUnstackDetachProcess failed \r\n"));
+		iRet = 5;
+		goto _ALL_FAILED;
+	}
+	 
+	SIZE_T ReturnLength = 0;
+	if (NULL == g_pfn_ZwQueryVirutalMemrory)
+	{
+		iRet = 6;
+		goto _ALL_FAILED;
+	}
+	status = g_pfn_ZwQueryVirutalMemrory(
+		hProcess,
+		pBaseAddress,
+		2,
+		pProcessPath,
+		260 * sizeof(WCHAR),
+		&ReturnLength
+	);
+	  
+	if (!NT_SUCCESS(status))
+	{
+		KdPrint(("SectionName Get Failed  \r\n")); 
+		iRet = 7; 
+		goto _ALL_FAILED;
+	}
+
+	goto _ALLOC_MEM_FAILED;
+
+_ALL_FAILED:
+	ExFreePool(pProcessPath);
+	pProcessPath = NULL;
+_ALLOC_MEM_FAILED:
+	ZwClose(hProcess);
+_OPEN_OBJECT_FAILED:
+	ObDereferenceObject(pEprocess);
+
+	return 0;
+}
+
 NTSTATUS
-NTAPI a(
+NTAPI MyNtCreateThread(
 	OUT PHANDLE ThreadHandle,
 	IN ACCESS_MASK DesiredAccess,
 	IN POBJECT_ATTRIBUTES ObjectAttributes,
@@ -439,202 +565,96 @@ NTAPI a(
 	IN BOOLEAN CreateSuspended
 )
 {
-	BOOLEAN deny = FALSE;
-	HANDLE currPid = PsGetCurrentProcessId();
-	HANDLE dstPid = NULL;
-	PVOID obj = NULL;
-	NTSTATUS status = ObReferenceObjectByHandle(ProcessHandle, GENERIC_ALL, *PsProcessType, KernelMode, &obj, NULL);
-	// 只有当EPROCESS取成功的时候才去做判断 
+	BOOLEAN  bDeny			      = FALSE;  
+	PVOID    pDstProcessObject    = NULL;
+	PVOID    pCurrentProcessObjet = NULL;
+	// Get dst process obj from handle
+	NTSTATUS status				  = ObReferenceObjectByHandle(
+																ProcessHandle, 
+																GENERIC_ALL, 
+																*PsProcessType, 
+																KernelMode, 
+																&pDstProcessObject, 
+																NULL
+															 );
+	// If get EPROCESS successed 
 	if (NT_SUCCESS(status))
 	{
-		dstPid = PsGetProcessId((PEPROCESS)obj);
+		// Get current process obj 
+		pCurrentProcessObjet = PsGetCurrentProcess(); 
 
-		// 只有当两个进程id不一样的时候才去做处理
-		if (dstPid != currPid)
+		// Only make a deal when curr pro obj not equal dst pro obj
+		if (pCurrentProcessObjet != pDstProcessObject)
 		{
+			UNICODE_STRING usPattern = { 0 };
 			do
-			{
-
-				NTSTATUS status = STATUS_SUCCESS;
-				HANDLE hProcess = NULL;
-				PEPROCESS eProcess = PsGetCurrentProcess();
-
-				if (NULL == eProcess)
+			{ 
+				// Get current process path and dest process path
+				// If any one get failed , break
+				PUNICODE_STRING pUsCurrProcessPath = NULL, pUsDstProcessPath = NULL;
+				int iRet = StGetProcessFullPathByObject((PEPROCESS)pCurrentProcessObjet, pUsCurrProcessPath);
+				if (iRet != 0 || !MmIsAddressValid(pUsCurrProcessPath))
 					break;
 
-				ObReferenceObject(eProcess);
-
-				PPEB pPeb = PsGetProcessPeb(eProcess);
-				PPEB pPeb2 = PsGetProcessPeb((PEPROCESS)obj);
-				if (NULL == pPeb || NULL == pPeb2)
+				iRet = StGetProcessFullPathByObject((PEPROCESS)pDstProcessObject, pUsDstProcessPath);
+				if (iRet != 0 || !MmIsAddressValid(pUsDstProcessPath))
+				{
+					ExFreePool(pUsCurrProcessPath);
+					pUsCurrProcessPath = NULL;
 					break;
+				}
+				 
+				ANSI_STRING asCurrentProcessPath = { 0 };
+				ANSI_STRING asDstProcessPath = { 0 };
 
-				status = ObOpenObjectByPointer(eProcess,          // Object    
-					OBJ_KERNEL_HANDLE,  // HandleAttributes    
-					NULL,               // PassedAccessState OPTIONAL    
-					0x0400,       // DesiredAccess    
-					*PsProcessType,     // ObjectType    
-					KernelMode,         // AccessMode    
-					&hProcess
-				);
-
+				// Convert from unicode string to ansi string  
+				status = RtlUnicodeStringToAnsiString(&asCurrentProcessPath, pUsCurrProcessPath, TRUE);
 				if (!NT_SUCCESS(status))
 				{
-					KdPrint(("ObOpenObjectByPointer failed:%u \r\n", RtlNtStatusToDosError(status)));
-					ObDereferenceObject(eProcess);
-					break;
+					goto _ANSI_FIRST_FAILED;
 				}
 
-				PUNICODE_STRING SectionName = (PUNICODE_STRING)ExAllocatePool(NonPagedPoolNx, 260 * sizeof(WCHAR));
-				PUNICODE_STRING SectionName2 = (PUNICODE_STRING)ExAllocatePool(NonPagedPoolNx, 260 * sizeof(WCHAR));
-
-				if (NULL == SectionName || SectionName2 == NULL)
-				{
-					ZwClose(hProcess);
-					ObDereferenceObject(eProcess);
-					KdPrint(("RExAllocatePool failed \r\n"));
-					break;
-				}
-
-				memset(SectionName, 0, 260 * sizeof(WCHAR));
-				memset(SectionName2, 0, 260 * sizeof(WCHAR));
-
-				PVOID pBaseAddress = NULL;
-				PVOID pBaseAddress2 = NULL;
-				BOOLEAN bAttach = FALSE;
-				KAPC_STATE ApcState;
-				if (eProcess != PsGetCurrentProcess()) {
-					bAttach = TRUE;
-					KeStackAttachProcess(eProcess, &ApcState);
-				}
-
-				__try {
-					pBaseAddress = pPeb->ImageBaseAddress;
-				}
-				__except (EXCEPTION_EXECUTE_HANDLER) {
-					pBaseAddress = NULL;
-				}
-
-				if (bAttach) {
-					KeUnstackDetachProcess(&ApcState);
-					bAttach = FALSE;
-				}
-
-				if ((PEPROCESS)obj != PsGetCurrentProcess()) {
-					bAttach = TRUE;
-					KeStackAttachProcess((PEPROCESS)obj, &ApcState);
-				}
-
-				__try {
-					pBaseAddress2 = pPeb2->ImageBaseAddress;
-				}
-				__except (EXCEPTION_EXECUTE_HANDLER) {
-					pBaseAddress2 = NULL;
-				}
-
-				if (bAttach) {
-					KeUnstackDetachProcess(&ApcState);
-					bAttach = FALSE;
-				}
-
-
-				if (pBaseAddress2 == NULL)
-				{
-					ZwClose(hProcess);
-					ExFreePool(SectionName);
-					ObDereferenceObject(eProcess);
-					KdPrint(("KeUnstackDetachProcess failed \r\n"));
-					break;
-				}
-
-
-				SIZE_T ReturnLength = 0;
-				status = pfn_ZwQueryVirutalMemrory(
-					hProcess,
-					pBaseAddress,
-					2,
-					SectionName,
-					260 * sizeof(WCHAR),
-					&ReturnLength
-				);
-				status = pfn_ZwQueryVirutalMemrory(
-					ProcessHandle,
-					pBaseAddress2,
-					2,
-					SectionName2,
-					260 * sizeof(WCHAR),
-					&ReturnLength
-				);
-				if (!NT_SUCCESS(status)) {
-					if (status == STATUS_INFO_LENGTH_MISMATCH) {
-						DbgPrint("Length IS NOT ENGOUTH !!! \r\n");
-					}
-
-					ExFreePool(SectionName);
-					ZwClose(hProcess);
-					ObDereferenceObject(eProcess);
-					break;
-				}
-
+				status = RtlUnicodeStringToAnsiString(&asDstProcessPath, pUsDstProcessPath, TRUE);
 				if (!NT_SUCCESS(status))
 				{
-					KdPrint(("SectionName Get Failed  \r\n"));
-					ExFreePool(SectionName);
-					ZwClose(hProcess);
-					ObDereferenceObject(eProcess);
-					break;
-				}
-				ANSI_STRING as = { 0 };
-				ANSI_STRING as2 = { 0 };
-				status = RtlUnicodeStringToAnsiString(&as, SectionName, TRUE);
-				status = RtlUnicodeStringToAnsiString(&as2, SectionName2, TRUE);
-
-				if (!NT_SUCCESS(status))
-				{
-					KdPrint(("RtlUnicodeStringToAnsiString Failed  \r\n"));
-					ExFreePool(SectionName);
-					ZwClose(hProcess);
-					ObDereferenceObject(eProcess);
-					break;
+					goto _ANSI_SECOND_FAILED;  
 				}
 
-				DbgPrint(
-					"DetectCreateRemoteThread >>ProcPath:%Z DstProc:%Z SrcPid:%p DstPid:%p Tid:%p bCreate:%d \r\n",
-					&as,
-					&as2,
-					currPid,
-					dstPid,
-					0,
-					0
-				);
-
-
-				UNICODE_STRING usPattern = { 0 };
+				KdPrint((
+					"DetectCreateRemoteThread >>Process [%Z]  CREATE REMOTE THREAD IN Process [%Z]  \r\n",
+					&asCurrentProcessPath,
+					&asDstProcessPath					 
+				));
+				 
+				
 				RtlInitUnicodeString(&usPattern, L"*REMOTEDLL*");
 
-				if (FsRtlIsNameInExpression(&usPattern, SectionName, TRUE, 0))
+				if (FsRtlIsNameInExpression(&usPattern, pUsCurrProcessPath, TRUE, 0))
 				{
-					deny = TRUE;
+					bDeny = TRUE;
 				}
-				RtlFreeAnsiString(&as);
-				RtlFreeAnsiString(&as2);
 
-				ExFreePool(SectionName);
-				ExFreePool(SectionName2);
 
-				ZwClose(hProcess);
-				ObDereferenceObject(eProcess);
-
+				RtlFreeAnsiString(&asDstProcessPath);
+			_ANSI_SECOND_FAILED:
+				RtlFreeAnsiString(&asCurrentProcessPath);
+				
+			_ANSI_FIRST_FAILED:
+				ExFreePool(pUsCurrProcessPath);
+				ExFreePool(pUsDstProcessPath); 
 			} while (FALSE);
 		}
-		ObDereferenceObject(obj);
+
+		ObDereferenceObject(pDstProcessObject);
 	}
-	if (deny)
+
+	if (bDeny)
 		return STATUS_MEDIA_WRITE_PROTECTED;
 
-	if (org)
-		return org(ThreadHandle, DesiredAccess, ObjectAttributes, ProcessHandle, ClientId, ThreadContext, UserStack, CreateSuspended);
-
+	if (g_pfnOrgNtCreateThread)
+		return g_pfnOrgNtCreateThread(ThreadHandle, DesiredAccess, ObjectAttributes, ProcessHandle, ClientId, ThreadContext, UserStack, CreateSuspended);
+	
+	return STATUS_NOT_IMPLEMENTED;
 }
 
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegistryPath)
@@ -644,15 +664,36 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pR
  
 //  	if (!InitNoExportApi())
 //  		return STATUS_UNSUCCESSFUL;
-	//OB_CALLBACK_REGISTRATION obReg;
-	//OB_OPERATION_REGISTRATION opReg;
+
+	// Get ZwQueryVirutalMemrory Routine Address
+	g_pfn_ZwQueryVirutalMemrory = static_cast<ReloadZwQueryVirtualMemory>(GetZwQueryVirtualMemoryAddress());
+	
+	// Restore the original NtCreateThread routine address
+	g_pfnOrgNtCreateThread = reinterpret_cast<pfn_NtCreateThread>((*(PULONG)0x80502c60)); // 仅测试用，直接拿NtCreateThread在SSDT表中的位置来替换
+	*(PULONG)0x80502c60 = reinterpret_cast<ULONG>(MyNtCreateThread);
+	
+	// Print the addresses after exchange the address
+	KdPrint(("DetectCreateRemoteThread: Org_NtCreateThread : %p Cur_NtCreateThread : %p \r\n", 
+		g_pfnOrgNtCreateThread, 
+		MyNtCreateThread));
+
+	// Support unload
+	pDriverObject->DriverUnload = DriverUnload;
+	return STATUS_SUCCESS;
+	 	
+ 	//return PsSetCreateThreadNotifyRoutine(CreateThreadNotifyRoutine);
+}
 
  
-	//PLDR_DATA ldr;
+//OB_CALLBACK_REGISTRATION obReg;
+//OB_OPERATION_REGISTRATION opReg;
 
-	// 绕过MmVerifyCallbackFunction。
-	//ldr = (PLDR_DATA)pDriverObject->DriverSection;
-	//ldr->Flags |= 0x20;
+
+//PLDR_DATA ldr;
+
+// 绕过MmVerifyCallbackFunction。
+//ldr = (PLDR_DATA)pDriverObject->DriverSection;
+//ldr->Flags |= 0x20;
 
 // 	memset(&obReg, 0, sizeof(obReg));
 // 	obReg.Version = OB_FLT_REGISTRATION_VERSION;
@@ -661,26 +702,13 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pR
 // 	RtlInitUnicodeString(&obReg.Altitude, L"321000");
 // 	memset(&opReg, 0, sizeof(opReg)); //初始化结构体变量
 
-									  //下面请注意这个结构体的成员字段的设置
+//下面请注意这个结构体的成员字段的设置
 // 	opReg.ObjectType = PsThreadType;
 // 	opReg.Operations = OB_OPERATION_HANDLE_CREATE ;
-// 
+//
 // 	opReg.PreOperation = (POB_PRE_OPERATION_CALLBACK)&preCall; //在这里注册一个回调函数指针
-// 
+//
 // 	obReg.OperationRegistration = &opReg; //注意这一条语句
 
-	
-	// return ObRegisterCallbacks(&obReg, &pre); //在这里注册回调函数
-	pfn_ZwQueryVirutalMemrory = static_cast<ReloadZwQueryVirtualMemory>(GetZwQueryVirtualMemoryAddress());
-	org = (pfn_NtCreateThread)(*(PULONG)0x80502c60);
-	*(PULONG)0x80502c60 = (ULONG)a;
-	DbgPrint("org:%p now:%p \r\n", org, a);
-	pDriverObject->DriverUnload = DriverUnload;
-	return STATUS_SUCCESS;
-
-
- 	pfn_ZwQueryVirutalMemrory =static_cast<ReloadZwQueryVirtualMemory>( GetZwQueryVirtualMemoryAddress());
+// return ObRegisterCallbacks(&obReg, &pre); //在这里注册回调函数
  
- 	pDriverObject->DriverUnload = DriverUnload;
- 	return PsSetCreateThreadNotifyRoutine(CreateThreadNotifyRoutine);
-}
